@@ -409,16 +409,22 @@ class TrueNASScaleClient:
         """Fetch Virtual Machines."""
         return await self.call("vm.query")
 
-    async def async_upgrade_app(self, app_name: str) -> Any:
-        """Upgrade an application to the latest version."""
-        try:
-            return await self.call("app.upgrade", {"app_name": app_name})
-        except Exception:
-            try:
-                return await self.call("app.upgrade", [app_name])
-            except Exception:
-                try:
-                    return await self.call("chart.release.upgrade", {"release_name": app_name})
-                except Exception:
-                    return await self.call("chart.release.upgrade", [app_name])
-
+    async def async_upgrade_app(self, app_name: str, version: Optional[str] = None) -> Any:
+        """Submit once, then check the background job through completion."""
+        options = {"app_version": version or "latest"}
+        job_id = await self.call("app.upgrade", [app_name, options])
+        if not isinstance(job_id, int) or isinstance(job_id, bool):
+            raise TrueNASAPIError(f"Unexpected upgrade job response for {app_name}: {job_id!r}")
+        deadline = asyncio.get_running_loop().time() + 1800
+        while asyncio.get_running_loop().time() < deadline:
+            jobs = await self.call("core.get_jobs", [[["id", "=", job_id]]])
+            if not jobs:
+                raise TrueNASAPIError(f"Upgrade job {job_id} for {app_name} could not be found; check TrueNAS Jobs before retrying")
+            job = jobs[0]
+            state = job.get("state")
+            if state == "SUCCESS":
+                return job.get("result")
+            if state in ("FAILED", "ABORTED"):
+                raise TrueNASAPIError(f"Upgrade job {job_id} for {app_name} {state.lower()}: {job.get('error') or 'No error details returned'}")
+            await asyncio.sleep(2)
+        raise TrueNASAPIError(f"Timed out waiting for upgrade job {job_id} for {app_name}; it may still be running. Check TrueNAS Jobs before retrying")

@@ -620,34 +620,50 @@ class TestTrueNASAPI(unittest.IsolatedAsyncioTestCase):
             ["pool.dataset.query", "dataset.query"],
         )
 
-    async def test_async_upgrade_app_primary_success(self):
-        client = TrueNASScaleClient("192.168.1.100", "key")
-        client.call = AsyncMock(return_value={"job_id": 1})
-        result = await client.async_upgrade_app("plex")
-        client.call.assert_called_once_with("app.upgrade", {"app_name": "plex"})
-        self.assertEqual(result, {"job_id": 1})
+    async def test_async_upgrade_app_waits_for_success(self):
+        client = TrueNASScaleClient("example.test", "key")
+        client.call = AsyncMock(side_effect=[17, [{"state": "WAITING"}], [{"state": "RUNNING"}], [{"state": "SUCCESS", "result": {"version": "2"}}]])
+        with patch("custom_components.truenas_scale.api.asyncio.sleep", new_callable=AsyncMock):
+            result = await client.async_upgrade_app("plex")
+        self.assertEqual(result, {"version": "2"})
+        self.assertEqual(client.call.call_args_list[0], call("app.upgrade", ["plex", {"app_version": "latest"}]))
+        self.assertEqual(client.call.call_args_list[1], call("core.get_jobs", [[["id", "=", 17]]]))
 
-    async def test_async_upgrade_app_falls_back_through_all_variants(self):
-        client = TrueNASScaleClient("192.168.1.100", "key")
-        client.call = AsyncMock(
-            side_effect=[
-                TrueNASAPIError("1"),
-                TrueNASAPIError("2"),
-                TrueNASAPIError("3"),
-                {"job_id": 4},
-            ]
-        )
-        result = await client.async_upgrade_app("plex")
-        self.assertEqual(result, {"job_id": 4})
-        self.assertEqual(
-            client.call.call_args_list,
-            [
-                call("app.upgrade", {"app_name": "plex"}),
-                call("app.upgrade", ["plex"]),
-                call("chart.release.upgrade", {"release_name": "plex"}),
-                call("chart.release.upgrade", ["plex"]),
-            ],
-        )
+    async def test_async_upgrade_app_passes_requested_version(self):
+        client = TrueNASScaleClient("example.test", "key")
+        client.call = AsyncMock(side_effect=[17, [{"state": "SUCCESS"}]])
+        await client.async_upgrade_app("plex", "2.0")
+        self.assertEqual(client.call.call_args_list[0], call("app.upgrade", ["plex", {"app_version": "2.0"}]))
+
+    async def test_async_upgrade_app_surfaces_terminal_job_errors(self):
+        for state in ("FAILED", "ABORTED"):
+            with self.subTest(state=state):
+                client = TrueNASScaleClient("example.test", "key")
+                client.call = AsyncMock(side_effect=[17, [{"state": state, "error": "Validation failed"}]])
+                with self.assertRaisesRegex(TrueNASAPIError, "Validation failed"):
+                    await client.async_upgrade_app("plex")
+                self.assertEqual(client.call.await_count, 2)
+
+    async def test_async_upgrade_app_does_not_resubmit_on_error(self):
+        client = TrueNASScaleClient("example.test", "key")
+        client.call = AsyncMock(side_effect=TrueNASAPIError("Permission denied"))
+        with self.assertRaisesRegex(TrueNASAPIError, "Permission denied"):
+            await client.async_upgrade_app("plex")
+        client.call.assert_awaited_once()
+
+    async def test_async_upgrade_app_rejects_invalid_job_id(self):
+        for response in (True, None, {"job_id": 17}):
+            with self.subTest(response=response):
+                client = TrueNASScaleClient("example.test", "key")
+                client.call = AsyncMock(return_value=response)
+                with self.assertRaisesRegex(TrueNASAPIError, "Unexpected upgrade job response"):
+                    await client.async_upgrade_app("plex")
+
+    async def test_async_upgrade_app_missing_job_warns_before_retry(self):
+        client = TrueNASScaleClient("example.test", "key")
+        client.call = AsyncMock(side_effect=[17, []])
+        with self.assertRaisesRegex(TrueNASAPIError, "check TrueNAS Jobs before retrying"):
+            await client.async_upgrade_app("plex")
 
 
 class TestSanitizeHostAndPort(unittest.TestCase):

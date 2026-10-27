@@ -1,9 +1,11 @@
 """Tests for TrueNAS Scale update platform."""
 
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
 from homeassistant.components.update import UpdateEntityFeature
+from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.truenas_scale.const import DATA_APPS, DATA_SYSTEM_INFO, DOMAIN
 from custom_components.truenas_scale.update import (
@@ -33,6 +35,9 @@ class TestTrueNASUpdateEntities(unittest.IsolatedAsyncioTestCase):
             }
         }
         self.entry = MagicMock()
+        self.entry.async_create_background_task.side_effect = (
+            lambda hass, coro, name: asyncio.create_task(coro, name=name)
+        )
         self.entry.entry_id = "test_entry"
         self.entry.data = {"host": "192.168.1.100"}
 
@@ -45,9 +50,10 @@ class TestTrueNASUpdateEntities(unittest.IsolatedAsyncioTestCase):
 
     async def test_app_update_install(self):
         update_entity = TrueNASAppUpdateEntity(self.coordinator, self.entry, "plex")
+        update_entity.async_write_ha_state = MagicMock()
         await update_entity.async_install(version="1.33.0", backup=False)
 
-        self.coordinator.client.async_upgrade_app.assert_called_with("plex")
+        self.coordinator.client.async_upgrade_app.assert_called_with("plex", "1.33.0")
         self.assertTrue(self.coordinator.async_request_refresh.called)
 
     def test_display_name_falls_back_to_slug(self):
@@ -107,7 +113,7 @@ class TestTrueNASUpdateEntities(unittest.IsolatedAsyncioTestCase):
         # raises NotImplementedError if the frontend requests them).
         update_entity = TrueNASAppUpdateEntity(self.coordinator, self.entry, "plex")
 
-        self.assertEqual(update_entity.supported_features, UpdateEntityFeature.INSTALL)
+        self.assertEqual(update_entity.supported_features, UpdateEntityFeature.INSTALL | UpdateEntityFeature.PROGRESS)
 
     def test_icon(self):
         update_entity = TrueNASAppUpdateEntity(self.coordinator, self.entry, "plex")
@@ -178,10 +184,39 @@ class TestTrueNASUpdateEntities(unittest.IsolatedAsyncioTestCase):
         )
         update_entity = TrueNASAppUpdateEntity(self.coordinator, self.entry, "plex")
 
-        with self.assertRaises(RuntimeError):
+        update_entity.async_write_ha_state = MagicMock()
+        with self.assertRaisesRegex(HomeAssistantError, "Upgrade failed"):
             await update_entity.async_install(version=None, backup=False)
 
         self.assertTrue(self.coordinator.async_request_refresh.called)
+
+    async def test_progress_is_independent_and_survives_caller_cancellation(self):
+        releases = {"plex": asyncio.Event(), "sonarr": asyncio.Event()}
+        async def upgrade(app, version):
+            await releases[app].wait()
+        self.coordinator.client.async_upgrade_app.side_effect = upgrade
+        entities = [TrueNASAppUpdateEntity(self.coordinator, self.entry, name) for name in releases]
+        for entity in entities:
+            entity.async_write_ha_state = MagicMock()
+        callers = [asyncio.create_task(entity.async_install(None, False)) for entity in entities]
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertTrue(all(entity.in_progress for entity in entities))
+        callers[0].cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await callers[0]
+        entities[0]._attr_in_progress = False  # HA's service wrapper clears this.
+        self.assertTrue(entities[0].in_progress)
+        with self.assertRaisesRegex(HomeAssistantError, "already in progress"):
+            await entities[0].async_install(None, False)
+        watcher = entities[0]._upgrade_task
+        releases["plex"].set()
+        await watcher
+        self.assertFalse(entities[0].in_progress)
+        self.assertTrue(entities[1].in_progress)
+        releases["sonarr"].set()
+        await callers[1]
+        self.assertFalse(entities[1].in_progress)
 
 
 class TestTrueNASUpdateSetupEntry(unittest.IsolatedAsyncioTestCase):

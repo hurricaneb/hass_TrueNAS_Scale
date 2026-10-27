@@ -1,5 +1,6 @@
 """Update platform for TrueNAS Scale integration."""
 
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -9,6 +10,7 @@ from homeassistant.components.update import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -53,7 +55,8 @@ class TrueNASAppUpdateEntity(CoordinatorEntity, UpdateEntity):
         # notifications) shows this instead of the entity name when set.
         self._attr_title = display_name
         self._attr_unique_id = f"{entry.entry_id}_app_update_{app_name}"
-        self._attr_supported_features = UpdateEntityFeature.INSTALL
+        self._upgrade_task = None
+        self._attr_supported_features = UpdateEntityFeature.INSTALL | UpdateEntityFeature.PROGRESS
 
     @staticmethod
     def _get_display_name(coordinator, app_name: str) -> str:
@@ -134,13 +137,31 @@ class TrueNASAppUpdateEntity(CoordinatorEntity, UpdateEntity):
             return f"An update for {self._attr_title} is available in TrueNAS SCALE."
         return None
 
+    @property
+    def in_progress(self) -> bool:
+        """Track this app's job independently of HA's service-call lifecycle."""
+        return self._upgrade_task is not None and not self._upgrade_task.done()
+
     async def async_install(self, version: Optional[str], backup: bool, **kwargs: Any) -> None:
-        """Install an update for the app directly from Home Assistant."""
+        """Submit a tracked task; caller cancellation must not cancel the job watcher."""
+        if self.in_progress:
+            raise HomeAssistantError("An upgrade is already in progress for this app")
+        self._upgrade_task = self.entry.async_create_background_task(
+            self.hass, self._async_watch_upgrade(version),
+            f"TrueNAS upgrade {self.app_name}",
+        )
+        self.async_write_ha_state()
+        await asyncio.shield(self._upgrade_task)
+
+    async def _async_watch_upgrade(self, version: Optional[str]) -> None:
+        """Keep progress active until the TrueNAS job succeeds or fails."""
         _LOGGER.info("Installing update for TrueNAS App '%s'", self.app_name)
         try:
-            await self.coordinator.client.async_upgrade_app(self.app_name)
+            await self.coordinator.client.async_upgrade_app(self.app_name, version)
         except Exception as err:
             _LOGGER.error("Failed to upgrade TrueNAS App '%s': %s", self.app_name, err)
-            raise
+            raise HomeAssistantError(f"Could not upgrade {self._attr_title}: {err}") from err
         finally:
+            self._upgrade_task = None
+            self.async_write_ha_state()
             await self.coordinator.async_request_refresh()
